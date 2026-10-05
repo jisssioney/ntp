@@ -4,6 +4,7 @@
 CLI:
     python ntp.py encode-packet   # JSON packet model  -> {"packet_hex", "length"}
     python ntp.py decode-packet   # {"packet_hex", "auth_digest_bytes"} -> model
+    python ntp.py compute-sample  # clock exchange timestamps -> sample
 
 No networking, wall-clock reads or randomness are used; identical input
 always produces identical output bytes.
@@ -20,6 +21,10 @@ MAX_U32 = (1 << 32) - 1
 MIN_I32 = -(1 << 31)
 MAX_I32 = (1 << 31) - 1
 MAX_U16 = (1 << 16) - 1
+
+# Dispersion accumulates at 15 microseconds per second of sample age.
+DISPERSION_RATE_US = 15
+MAX_SAMPLE_US = 4294967295999999
 
 HEADER_LENGTH = 48
 MAX_PACKET_LENGTH = 65535
@@ -50,6 +55,14 @@ OPTIONAL_ENCODE_FIELDS = frozenset({"auth"})
 EXT_FIELDS = ("type", "value")
 AUTH_FIELDS = ("key_id", "digest")
 DECODE_FIELDS = ("packet_hex", "auth_digest_bytes")
+SAMPLE_FIELDS = (
+    "originate_timestamp",
+    "receive_timestamp",
+    "transmit_timestamp",
+    "destination_timestamp",
+    "dispersion",
+    "now",
+)
 
 HEX_DIGITS = frozenset("0123456789abcdef")
 
@@ -60,6 +73,10 @@ class ParamError(Exception):
 
 class PacketError(Exception):
     """The binary packet / its wire structure is malformed (exit code 3)."""
+
+
+class StateError(Exception):
+    """The timestamps describe an impossible clock sample (exit code 5)."""
 
 
 def round_half_even(numerator, denominator):
@@ -311,6 +328,47 @@ def decode_packet(model):
     }
 
 
+def compute_sample(model):
+    validate_object(model, set(SAMPLE_FIELDS), set(SAMPLE_FIELDS), "request")
+
+    def stamp(key):
+        return as_int(model[key], key, 0, MAX_SAMPLE_US)
+
+    originate = stamp("originate_timestamp")
+    receive = stamp("receive_timestamp")
+    transmit = stamp("transmit_timestamp")
+    destination = stamp("destination_timestamp")
+    base_dispersion = stamp("dispersion")
+    now = stamp("now")
+
+    # State checks resolve in a fixed order when several hold at once.
+    if receive < originate:
+        raise StateError("receive_timestamp precedes originate_timestamp")
+    if destination < originate:
+        raise StateError("destination_timestamp precedes originate_timestamp")
+    if now < destination:
+        raise StateError("now precedes destination_timestamp")
+
+    offset = round_half_even(
+        (receive - originate) + (transmit - destination), 2
+    )
+    delay = (destination - originate) - (transmit - receive)
+    if delay < 0:
+        raise StateError("negative round-trip delay")
+
+    age = now - destination
+    dispersion = base_dispersion + round_half_even(
+        age * DISPERSION_RATE_US, MICROS_PER_SECOND
+    )
+
+    return {
+        "offset": offset,
+        "delay": delay,
+        "dispersion": dispersion,
+        "age": age,
+    }
+
+
 def emit_error(kind, message):
     sys.stderr.write(json.dumps(
         {"error": kind, "message": message}, separators=(",", ":")
@@ -335,6 +393,8 @@ def main(argv):
         handler = encode_packet
     elif command == "decode-packet":
         handler = decode_packet
+    elif command == "compute-sample":
+        handler = compute_sample
     else:
         emit_error("ParamError", "unknown subcommand")
         return 2
@@ -352,6 +412,9 @@ def main(argv):
     except PacketError as exc:
         emit_error("PacketError", str(exc))
         return 3
+    except StateError as exc:
+        emit_error("StateError", str(exc))
+        return 5
 
     if command == "encode-packet":
         packet_hex = result.hex()

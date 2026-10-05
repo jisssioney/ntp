@@ -171,6 +171,121 @@ class RoundTripTests(unittest.TestCase):
         )
 
 
+class ComputeSampleTests(unittest.TestCase):
+    FIELDS = ("originate_timestamp", "receive_timestamp", "transmit_timestamp",
+              "destination_timestamp", "dispersion", "now")
+
+    def sample(self, **overrides):
+        values = {
+            "originate_timestamp": 100,
+            "receive_timestamp": 130,
+            "transmit_timestamp": 160,
+            "destination_timestamp": 200,
+            "dispersion": 50,
+            "now": 1_200_200,
+        }
+        values.update(overrides)
+        return values
+
+    def compute(self, values):
+        proc = run_cli("compute-sample", values)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(list(out), ["offset", "delay", "dispersion", "age"])
+        return out
+
+    def assert_state_error(self, values):
+        proc = run_cli("compute-sample", values)
+        self.assertEqual(proc.returncode, 5, proc.stdout)
+        self.assertEqual(proc.stdout, b"")
+        err = json.loads(proc.stderr)
+        self.assertEqual(list(err), ["error", "message"])
+        self.assertEqual(err["error"], "StateError")
+        return err["message"]
+
+    def test_basic_arithmetic(self):
+        # offset = ((130-100)+(160-200))/2 = -5; delay = (200-100)-(160-130)
+        # = 70; age = 1200000; dispersion = 50 + 18 = 68
+        out = self.compute(self.sample())
+        self.assertEqual(out, {"offset": -5, "delay": 70,
+                               "dispersion": 68, "age": 1_200_000})
+
+    def test_offset_half_microsecond_rounds_to_even(self):
+        # (R-O)+(T-D) = 1-2 = -1 -> -0.5 rounds to 0
+        out = self.compute(self.sample(
+            originate_timestamp=0, receive_timestamp=1,
+            transmit_timestamp=10, destination_timestamp=12,
+            dispersion=0, now=100_012))
+        self.assertEqual(out["offset"], 0)
+        # age 100000 -> 1.5 us dispersion, rounds to even 2
+        self.assertEqual(out["dispersion"], 2)
+
+    def test_dispersion_accumulation_and_tie(self):
+        # age 300000 -> 4.5 us, rounds to even 4; base 7 -> 11
+        out = self.compute(self.sample(
+            originate_timestamp=0, receive_timestamp=1,
+            transmit_timestamp=13, destination_timestamp=13,
+            dispersion=7, now=300_013))
+        self.assertEqual(out["age"], 300_000)
+        self.assertEqual(out["dispersion"], 11)
+
+    def test_large_age(self):
+        out = self.compute(self.sample(
+            originate_timestamp=0, receive_timestamp=0, transmit_timestamp=0,
+            destination_timestamp=0, dispersion=1000, now=4_000_000_000))
+        self.assertEqual(out["dispersion"], 61_000)
+
+    def test_max_values_accepted(self):
+        out = self.compute(self.sample(**{k: 4294967295999999 for k in self.FIELDS}))
+        self.assertEqual(out["age"], 0)
+        self.assertEqual(out["dispersion"], 4294967295999999)
+
+    def test_state_error_order(self):
+        # T<R takes precedence over D<O and now<D
+        msg = self.assert_state_error(self.sample(
+            originate_timestamp=100, receive_timestamp=5, transmit_timestamp=4,
+            destination_timestamp=90, now=80))
+        self.assertIn("receive_timestamp", msg)
+        # D<O takes precedence over now<D
+        msg = self.assert_state_error(self.sample(
+            originate_timestamp=100, receive_timestamp=100, transmit_timestamp=100,
+            destination_timestamp=90, now=80))
+        self.assertIn("destination_timestamp", msg)
+        self.assert_state_error(self.sample(
+            originate_timestamp=0, receive_timestamp=0, transmit_timestamp=0,
+            destination_timestamp=10, now=9))
+        # timestamps ordered, but the round trip has negative delay
+        self.assert_state_error(self.sample(
+            originate_timestamp=0, receive_timestamp=0, transmit_timestamp=10,
+            destination_timestamp=5, now=5))
+
+    def test_param_errors(self):
+        def bad(values):
+            proc = run_cli("compute-sample", values)
+            self.assertEqual(proc.returncode, 2, proc.stdout)
+            self.assertEqual(proc.stdout, b"")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"], "ParamError")
+
+        bad([1, 2])
+        bad({"originate_timestamp": 0})
+        values = self.sample()
+        extra = dict(values)
+        extra["surprise"] = 1
+        bad(extra)
+        for wrong in (True, 1.5, "0", None):
+            bad(self.sample(originate_timestamp=wrong))
+        bad(self.sample(now=-1))
+        bad(self.sample(dispersion=4294967296000000))
+        bad("not json")
+
+    def test_deterministic(self):
+        values = self.sample()
+        first = run_cli("compute-sample", values).stdout
+        second = run_cli("compute-sample", values).stdout
+        self.assertEqual(first, second)
+
+
 class ErrorTests(unittest.TestCase):
     def assert_param_error(self, subcommand, payload):
         proc = run_cli(subcommand, payload)
