@@ -4,6 +4,7 @@
 CLI:
     python ntp.py encode-packet   # JSON packet model  -> {"packet_hex", "length"}
     python ntp.py decode-packet   # {"packet_hex", "auth_digest_bytes"} -> model
+    python ntp.py compute-sample  # clock sample timestamps -> offset/delay stats
 
 No networking, wall-clock reads or randomness are used; identical input
 always produces identical output bytes.
@@ -27,6 +28,19 @@ EXT_HEADER_LENGTH = 4
 MIN_EXT_TOTAL = 16
 MAC_KEY_ID_LENGTH = 4
 VALID_DIGEST_LENGTHS = (0, 16, 20)
+
+MAX_SAMPLE_MICROS = 4294967295999999
+DISPERSION_MICROS_PER_SECOND = 15
+
+SAMPLE_FIELDS = (
+    "originate_timestamp",
+    "receive_timestamp",
+    "transmit_timestamp",
+    "destination_timestamp",
+    "dispersion",
+    "now",
+)
+SAMPLE_OUTPUT_FIELDS = ("offset", "delay", "dispersion", "age")
 
 ENCODE_FIELDS = [
     "leap",
@@ -60,6 +74,10 @@ class ParamError(Exception):
 
 class PacketError(Exception):
     """The binary packet / its wire structure is malformed (exit code 3)."""
+
+
+class StateError(Exception):
+    """The clock sample's timestamps are internally inconsistent (exit 5)."""
 
 
 def round_half_even(numerator, denominator):
@@ -311,6 +329,41 @@ def decode_packet(model):
     }
 
 
+def compute_sample(model):
+    validate_object(model, set(SAMPLE_FIELDS), set(SAMPLE_FIELDS), "request")
+    values = {key: as_int(model[key], key, 0, MAX_SAMPLE_MICROS)
+              for key in SAMPLE_FIELDS}
+
+    o = values["originate_timestamp"]
+    r = values["receive_timestamp"]
+    t = values["transmit_timestamp"]
+    d = values["destination_timestamp"]
+    base_dispersion = values["dispersion"]
+    now = values["now"]
+
+    if t < r:
+        raise StateError("transmit_timestamp precedes receive_timestamp")
+    if d < o:
+        raise StateError("destination_timestamp precedes originate_timestamp")
+    if now < d:
+        raise StateError("now precedes destination_timestamp")
+    delay = (d - o) - (t - r)
+    if delay < 0:
+        raise StateError("negative round-trip delay")
+
+    offset = round_half_even((r - o) + (t - d), 2)
+    age = now - d
+    dispersion = base_dispersion + round_half_even(
+        age * DISPERSION_MICROS_PER_SECOND, MICROS_PER_SECOND
+    )
+    return {
+        "offset": offset,
+        "delay": delay,
+        "dispersion": dispersion,
+        "age": age,
+    }
+
+
 def emit_error(kind, message):
     sys.stderr.write(json.dumps(
         {"error": kind, "message": message}, separators=(",", ":")
@@ -335,6 +388,8 @@ def main(argv):
         handler = encode_packet
     elif command == "decode-packet":
         handler = decode_packet
+    elif command == "compute-sample":
+        handler = compute_sample
     else:
         emit_error("ParamError", "unknown subcommand")
         return 2
@@ -352,6 +407,9 @@ def main(argv):
     except PacketError as exc:
         emit_error("PacketError", str(exc))
         return 3
+    except StateError as exc:
+        emit_error("StateError", str(exc))
+        return 5
 
     if command == "encode-packet":
         packet_hex = result.hex()

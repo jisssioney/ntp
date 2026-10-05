@@ -20,6 +20,19 @@ def run_cli(subcommand, payload):
     return proc
 
 
+def sample_model(**overrides):
+    model = {
+        "originate_timestamp": 1000,
+        "receive_timestamp": 1200,
+        "transmit_timestamp": 1400,
+        "destination_timestamp": 1600,
+        "dispersion": 100,
+        "now": 2600000,
+    }
+    model.update(overrides)
+    return model
+
+
 def base_model(**overrides):
     model = {
         "leap": 0,
@@ -169,6 +182,136 @@ class RoundTripTests(unittest.TestCase):
             self.decode(out["packet_hex"], 0)["extensions"][0]["value"],
             model["extensions"][0]["value"],
         )
+
+
+class ComputeSampleTests(unittest.TestCase):
+    def compute(self, model):
+        proc = run_cli("compute-sample", model)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, b"")
+        out = json.loads(proc.stdout)
+        self.assertEqual(list(out),
+                         ["offset", "delay", "dispersion", "age"])
+        return out
+
+    def test_basic_sample(self):
+        out = self.compute(sample_model())
+        self.assertEqual(out, {"offset": 0, "delay": 400,
+                               "dispersion": 139, "age": 2598400})
+
+    def test_negative_offset(self):
+        out = self.compute(sample_model(
+            receive_timestamp=1100, transmit_timestamp=1200,
+            destination_timestamp=1500, now=1500, dispersion=0))
+        self.assertEqual(out["offset"], -100)
+        self.assertEqual(out["delay"], 400)
+
+    def test_offset_half_microsecond_to_even(self):
+        # numerator 7 -> 3.5 rounds up to even 4
+        up = self.compute(sample_model(
+            originate_timestamp=0, receive_timestamp=10,
+            transmit_timestamp=10, destination_timestamp=13,
+            dispersion=0, now=13))
+        self.assertEqual(up["offset"], 4)
+        # numerator 5 -> 2.5 stays at even 2
+        stay = self.compute(sample_model(
+            originate_timestamp=0, receive_timestamp=9,
+            transmit_timestamp=9, destination_timestamp=13,
+            dispersion=0, now=13))
+        self.assertEqual(stay["offset"], 2)
+
+    def test_dispersion_accumulates_per_second(self):
+        tie = self.compute(sample_model(
+            originate_timestamp=0, receive_timestamp=0, transmit_timestamp=0,
+            destination_timestamp=0, dispersion=7, now=100000))
+        self.assertEqual(tie["dispersion"], 9)       # 7 + round(1.5) = 9
+        down = self.compute(sample_model(
+            originate_timestamp=0, receive_timestamp=0, transmit_timestamp=0,
+            destination_timestamp=0, dispersion=7, now=99999))
+        self.assertEqual(down["dispersion"], 8)      # 7 + round(1.499..)
+
+    def test_equality_bounds_are_valid(self):
+        out = self.compute(sample_model(
+            originate_timestamp=1000, receive_timestamp=1005,
+            transmit_timestamp=1005, destination_timestamp=1000,
+            dispersion=0, now=1000))
+        self.assertEqual(out["delay"], 0)
+        self.assertEqual(out["age"], 0)
+
+    def test_field_upper_bound(self):
+        top = ntp.MAX_SAMPLE_MICROS
+        out = self.compute(sample_model(
+            originate_timestamp=top, receive_timestamp=top,
+            transmit_timestamp=top, destination_timestamp=top,
+            dispersion=top, now=top))
+        self.assertEqual(out, {"offset": 0, "delay": 0,
+                               "dispersion": top, "age": 0})
+
+    def test_state_error_priority(self):
+        def state_error(model):
+            proc = run_cli("compute-sample", model)
+            self.assertEqual(proc.returncode, 5, proc.stdout)
+            self.assertEqual(proc.stdout, b"")
+            err = json.loads(proc.stderr)
+            self.assertEqual(list(err), ["error", "message"])
+            self.assertEqual(err["error"], "StateError")
+            return err["message"]
+
+        # All four violations present -> T<R wins.
+        msg = state_error(sample_model(
+            originate_timestamp=1000, receive_timestamp=1200,
+            transmit_timestamp=1100, destination_timestamp=900, now=800))
+        self.assertIn("transmit", msg)
+        # T==R, remaining three present -> D<O.
+        msg = state_error(sample_model(
+            originate_timestamp=1000, receive_timestamp=1200,
+            transmit_timestamp=1200, destination_timestamp=900, now=800))
+        self.assertIn("destination", msg)
+        # Only now<D and delay<0 remain -> now<D.
+        msg = state_error(sample_model(
+            originate_timestamp=1000, receive_timestamp=1010,
+            transmit_timestamp=1010, destination_timestamp=1600, now=1500))
+        self.assertIn("now", msg)
+        # Only delay<0 remains.
+        msg = state_error(sample_model(
+            originate_timestamp=1000, receive_timestamp=1001,
+            transmit_timestamp=1002, destination_timestamp=1000, now=1000))
+        self.assertIn("delay", msg)
+
+    def test_param_errors(self):
+        def param_error(model):
+            proc = run_cli("compute-sample", model)
+            self.assertEqual(proc.returncode, 2, proc.stdout)
+            self.assertEqual(proc.stdout, b"")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"], "ParamError")
+            return proc
+
+        param_error([1, 2])
+        missing = sample_model()
+        del missing["now"]
+        param_error(missing)
+        param_error(sample_model(surprise=1))
+        param_error(sample_model(dispersion=True))
+        param_error(sample_model(dispersion=-1))
+        param_error(sample_model(now=ntp.MAX_SAMPLE_MICROS + 1))
+        param_error(sample_model(dispersion=1.5))
+        param_error(sample_model(dispersion="0"))
+        param_error(None)
+
+    def test_invalid_json_and_unknown_command(self):
+        proc = subprocess.run(
+            [sys.executable, str(REPO / "ntp.py"), "compute-sample"],
+            input=b"not json", capture_output=True)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(json.loads(proc.stderr)["error"], "ParamError")
+
+    def test_deterministic(self):
+        model = sample_model()
+        first = run_cli("compute-sample", model).stdout
+        second = run_cli("compute-sample", model).stdout
+        self.assertEqual(first, second)
 
 
 class ErrorTests(unittest.TestCase):
